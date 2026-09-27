@@ -1,0 +1,972 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Relativity & Rocket Physics — Interactive Graphs</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js"></script>
+<script>
+// Global state for right-click-hold
+const rightClickState = {
+  activeChart: null,
+  canvasX: 0,
+  canvasY: 0
+};
+
+// Custom HTML tooltip element — one shared across all charts
+let customTooltipEl = null;
+function getTooltipEl() {
+  if (!customTooltipEl) {
+    customTooltipEl = document.createElement('div');
+    customTooltipEl.style.cssText = `
+      position: fixed;
+      pointer-events: none;
+      background: rgba(10, 14, 20, 0.95);
+      border: 1px solid #444;
+      border-radius: 6px;
+      padding: 10px 12px;
+      color: #e6e6e6;
+      font-family: "SF Mono", Consolas, monospace;
+      font-size: 12px;
+      line-height: 1.5;
+      z-index: 10000;
+      display: none;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+      max-width: 320px;
+    `;
+    document.body.appendChild(customTooltipEl);
+  }
+  return customTooltipEl;
+}
+
+function hideTooltip() {
+  const el = getTooltipEl();
+  el.style.display = 'none';
+}
+
+// Crosshair plugin — draws vertical line for the chart that's currently right-click-held
+const crosshairPlugin = {
+  id: 'crosshair',
+  afterDraw: (chart) => {
+    if (rightClickState.activeChart !== chart) return;
+    const x = rightClickState.canvasX;
+    const topY = chart.chartArea.top;
+    const bottomY = chart.chartArea.bottom;
+    // Only draw if cursor is within chart area
+    if (x < chart.chartArea.left || x > chart.chartArea.right) return;
+    const ctx = chart.ctx;
+    ctx.save();
+    ctx.beginPath();
+    ctx.moveTo(x, topY);
+    ctx.lineTo(x, bottomY);
+    ctx.lineWidth = 1;
+    ctx.strokeStyle = 'rgba(255, 255, 255, 0.7)';
+    ctx.setLineDash([4, 4]);
+    ctx.stroke();
+    ctx.restore();
+
+    // Also draw dots where the line intersects each visible dataset
+    chart.data.datasets.forEach((dataset, i) => {
+      const meta = chart.getDatasetMeta(i);
+      if (meta.hidden) return;
+      // Find closest data point by x-value on the axis
+      const dataX = chart.scales.x.getValueForPixel(x);
+      let closestPoint = null;
+      let closestDist = Infinity;
+      dataset.data.forEach(pt => {
+        const d = Math.abs(pt.x - dataX);
+        if (d < closestDist) {
+          closestDist = d;
+          closestPoint = pt;
+        }
+      });
+      if (closestPoint) {
+        const pxX = chart.scales.x.getPixelForValue(closestPoint.x);
+        const pxY = chart.scales.y.getPixelForValue(closestPoint.y);
+        if (pxY >= chart.chartArea.top && pxY <= chart.chartArea.bottom) {
+          ctx.save();
+          ctx.beginPath();
+          ctx.arc(pxX, pxY, 5, 0, Math.PI * 2);
+          ctx.fillStyle = dataset.borderColor;
+          ctx.fill();
+          ctx.strokeStyle = '#fff';
+          ctx.lineWidth = 1.5;
+          ctx.stroke();
+          ctx.restore();
+        }
+      }
+    });
+  }
+};
+Chart.register(crosshairPlugin);
+
+// Format the custom tooltip HTML for a given chart at a given canvas-x
+function buildTooltipHtml(chart, canvasX) {
+  const dataX = chart.scales.x.getValueForPixel(canvasX);
+  const config = chart.$customTooltipConfig || {};
+
+  // Title (formatted x value)
+  let titleStr = '';
+  if (config.titleFormat) {
+    titleStr = config.titleFormat(dataX);
+  } else {
+    titleStr = `x = ${dataX.toFixed(4)}`;
+  }
+
+  // Per-dataset rows
+  const rows = [];
+  chart.data.datasets.forEach((dataset, i) => {
+    const meta = chart.getDatasetMeta(i);
+    if (meta.hidden) return;
+    // Find the closest data point
+    let closest = null;
+    let closestDist = Infinity;
+    dataset.data.forEach(pt => {
+      const d = Math.abs(pt.x - dataX);
+      if (d < closestDist) {
+        closestDist = d;
+        closest = pt;
+      }
+    });
+    if (!closest) return;
+    const color = dataset.borderColor;
+    const labelText = config.labelFormat
+      ? config.labelFormat(dataset, closest)
+      : `${dataset.label}: ${closest.y}`;
+    rows.push(`<div style="display:flex;align-items:center;gap:8px;margin-top:3px;">
+      <span style="display:inline-block;width:10px;height:10px;background:${color};border-radius:2px;flex-shrink:0;"></span>
+      <span>${labelText}</span>
+    </div>`);
+  });
+
+  return `<div style="font-weight:bold;margin-bottom:4px;color:#fbbf24;">${titleStr}</div>${rows.join('')}`;
+}
+
+function showTooltipAt(chart, canvasX, canvasY, pageX, pageY) {
+  const el = getTooltipEl();
+  el.innerHTML = buildTooltipHtml(chart, canvasX);
+  el.style.display = 'block';
+  // Position: offset from cursor, but keep on-screen
+  let left = pageX + 15;
+  let top = pageY + 15;
+  // Measure after setting content
+  const rect = el.getBoundingClientRect();
+  if (left + rect.width > window.innerWidth - 10) {
+    left = pageX - rect.width - 15;
+  }
+  if (top + rect.height > window.innerHeight - 10) {
+    top = pageY - rect.height - 15;
+  }
+  el.style.left = left + 'px';
+  el.style.top = top + 'px';
+}
+
+// Attach right-click-hold and double-click-zoom to a chart
+function attachChartInteractions(chart) {
+  const canvas = chart.canvas;
+
+  // Store original x-axis bounds
+  const original = {
+    xMin: chart.options.scales.x.min,
+    xMax: chart.options.scales.x.max
+  };
+  chart.$originalBounds = original;
+
+  // Suppress the default context menu on the chart
+  canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+
+  canvas.addEventListener('mousedown', (e) => {
+    if (e.button === 2) { // right-click
+      e.preventDefault();
+      const rect = canvas.getBoundingClientRect();
+      const x = e.clientX - rect.left;
+      const y = e.clientY - rect.top;
+      rightClickState.activeChart = chart;
+      rightClickState.canvasX = x;
+      rightClickState.canvasY = y;
+      chart.render(); // trigger redraw to show crosshair
+      showTooltipAt(chart, x, y, e.clientX, e.clientY);
+    }
+  });
+
+  canvas.addEventListener('mousemove', (e) => {
+    if (rightClickState.activeChart === chart) {
+      const rect = canvas.getBoundingClientRect();
+      const x = e.clientX - rect.left;
+      const y = e.clientY - rect.top;
+      rightClickState.canvasX = x;
+      rightClickState.canvasY = y;
+      chart.render();
+      showTooltipAt(chart, x, y, e.clientX, e.clientY);
+    }
+  });
+
+  // Double-click on chart: zoom x-axis centered on click
+  canvas.addEventListener('dblclick', (e) => {
+    e.preventDefault();
+    e.stopPropagation(); // so document dblclick doesn't also fire reset
+
+    // Suppress rocket-chart line-click that might fire right after dblclick
+    window.__suppressRocketClick = true;
+    setTimeout(() => { window.__suppressRocketClick = false; }, 400);
+
+    const rect = canvas.getBoundingClientRect();
+    const clickX = e.clientX - rect.left;
+    const dataX = chart.scales.x.getValueForPixel(clickX);
+
+    const currentMin = chart.scales.x.min;
+    const currentMax = chart.scales.x.max;
+    const currentSpan = currentMax - currentMin;
+
+    // Zoom in by factor of 3, centered on dataX
+    const newSpan = currentSpan / 3;
+    let newMin = dataX - newSpan / 2;
+    let newMax = dataX + newSpan / 2;
+
+    // Clamp to original bounds
+    const hardMin = original.xMin;
+    const hardMax = original.xMax;
+    if (newMin < hardMin) {
+      newMax += (hardMin - newMin);
+      newMin = hardMin;
+    }
+    if (newMax > hardMax) {
+      newMin -= (newMax - hardMax);
+      newMax = hardMax;
+      if (newMin < hardMin) newMin = hardMin;
+    }
+
+    chart.options.scales.x.min = newMin;
+    chart.options.scales.x.max = newMax;
+    chart.update();
+  });
+}
+
+// Global mouseup releases right-click hold
+document.addEventListener('mouseup', (e) => {
+  if (rightClickState.activeChart) {
+    const chart = rightClickState.activeChart;
+    rightClickState.activeChart = null;
+    hideTooltip();
+    chart.render(); // redraw to remove crosshair
+  }
+});
+
+// Double-click anywhere outside all canvases resets all charts
+document.addEventListener('dblclick', (e) => {
+  if (e.target.tagName === 'CANVAS') return;
+  if (window.allCharts) {
+    window.allCharts.forEach(chart => {
+      chart.options.scales.x.min = chart.$originalBounds.xMin;
+      chart.options.scales.x.max = chart.$originalBounds.xMax;
+      if (chart === window.rocketChartRef) {
+        chart.options.scales.y.min = 0.1;
+        chart.options.scales.y.max = undefined;
+        const zi = document.getElementById('zoomInfo');
+        if (zi) zi.innerHTML = 'Click any line to zoom the axes to that fuel. Double-click anywhere on the graph to zoom in on that x-point; double-click off the graph to reset.';
+      }
+      chart.update();
+    });
+  }
+});
+
+window.allCharts = [];
+</script>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    max-width: 1100px;
+    margin: 0 auto;
+    padding: 24px;
+    background: #0f1419;
+    color: #e6e6e6;
+  }
+  h1 { color: #7dd3fc; margin-bottom: 8px; }
+  h2 { color: #fbbf24; margin-top: 40px; border-bottom: 1px solid #334; padding-bottom: 8px; }
+  p.intro { color: #aaa; margin-bottom: 32px; }
+  p.desc { color: #bbb; font-size: 14px; margin: 8px 0 16px 0; }
+  .chart-container {
+    background: #1a2028;
+    border-radius: 12px;
+    padding: 20px;
+    margin-bottom: 24px;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+    position: relative;
+    height: 450px;
+  }
+  .controls {
+    background: #1a2028;
+    border-radius: 8px;
+    padding: 12px 16px;
+    margin-bottom: 16px;
+    font-size: 14px;
+  }
+  .controls label { margin-right: 16px; cursor: pointer; }
+  .readout {
+    background: #0d1117;
+    border-left: 3px solid #7dd3fc;
+    padding: 12px 16px;
+    margin: 12px 0;
+    font-family: "SF Mono", Consolas, monospace;
+    font-size: 13px;
+  }
+  input[type="range"] { width: 300px; vertical-align: middle; }
+  .value { color: #fbbf24; font-weight: bold; }
+</style>
+</head>
+<body>
+
+<h1>Relativity & Rocket Physics</h1>
+<p class="intro">Four interactive graphs exploring time dilation, length contraction, the rocket equation, and relativistic kinetic energy.<br>
+<strong>Right-click and hold</strong> anywhere on a graph to see exact values.
+<strong>Double-click</strong> on a graph to zoom the x-axis around that point.
+<strong>Double-click outside</strong> any graph to reset all zoom.</p>
+
+<h2>1. Time Dilation vs. Speed</h2>
+<p class="desc">How much time passes on a moving clock for every 1 second of Earth time. Both axes are logarithmic — the interesting behavior is near v = c. Formula: t' / t = √(1 − v²/c²) = 1/γ</p>
+<div class="controls">
+  <label>Speed: <input type="range" id="timeSlider" min="0" max="0.999999" step="0.000001" value="0.9"></label>
+  <span class="value" id="timeSpeedVal">0.9c</span>
+</div>
+<div class="readout" id="timeReadout"></div>
+<div class="chart-container"><canvas id="timeChart"></canvas></div>
+
+<h2>2. Length Contraction vs. Speed</h2>
+<p class="desc">How long a 1 light-year ruler appears to an observer moving past it. Same formula as time dilation — moving rulers shrink by the same factor moving clocks slow. Formula: L' / L = √(1 − v²/c²)</p>
+<div class="controls">
+  <label>Speed: <input type="range" id="spaceSlider" min="0" max="0.999999" step="0.000001" value="0.9"></label>
+  <span class="value" id="spaceSpeedVal">0.9c</span>
+</div>
+<div class="readout" id="spaceReadout"></div>
+<div class="chart-container"><canvas id="spaceChart"></canvas></div>
+
+<h2>3. Rocket Equation — Fuel Required by Propellant Type</h2>
+<p class="desc">Fuel mass needed to accelerate a 1000 kg payload to a given Δv, using the relativistic rocket equation. Y-axis is logarithmic because the numbers span many orders of magnitude. Each line is a different exhaust velocity.</p>
+<div class="controls">
+  <label><input type="checkbox" class="fuelToggle" data-idx="0" checked> Chemical (4.4 km/s)</label>
+  <label><input type="checkbox" class="fuelToggle" data-idx="1" checked> Ion drive (50 km/s)</label>
+  <label><input type="checkbox" class="fuelToggle" data-idx="2" checked> Nuclear thermal (10 km/s)</label>
+  <label><input type="checkbox" class="fuelToggle" data-idx="3" checked> Fusion (10,000 km/s)</label>
+  <label><input type="checkbox" class="fuelToggle" data-idx="4" checked> Astrophage (fictional, 0.1c)</label>
+  <label><input type="checkbox" class="fuelToggle" data-idx="5" checked> Antimatter (c)</label>
+</div>
+<div class="readout" id="zoomInfo">Click any line to zoom the axes to that fuel. Double-click anywhere on the graph to zoom in on that x-point; double-click off the graph to reset.</div>
+<div class="chart-container"><canvas id="rocketChart"></canvas></div>
+
+<h2>4. Relativistic Kinetic Energy vs. Velocity</h2>
+<p class="desc">Kinetic energy of a 1 kg object as it approaches light speed. Y-axis is logarithmic. Notice how the Newtonian curve (½mv²) and relativistic curve agree at low speeds, then diverge dramatically. The relativistic KE shoots toward infinity as v → c. Formula: KE = (γ − 1)mc²</p>
+<div class="controls">
+  <label>Velocity: <input type="range" id="keSlider" min="0" max="0.999999" step="0.000001" value="0.5"></label>
+  <span class="value" id="keSpeedVal">0.5c</span>
+</div>
+<div class="readout" id="keReadout"></div>
+<div class="chart-container"><canvas id="keChart"></canvas></div>
+
+<script>
+const c = 299792458; // m/s
+
+// ========== Helper: generate log-spaced points for speed 0 → 1 ==========
+// We generate points that get denser near v = 1
+function generateSpeedPoints(n) {
+  const points = [];
+  // Use 1 - 10^(-k) spacing to get dense points near 1
+  for (let i = 0; i <= n; i++) {
+    const frac = i / n;
+    // Map [0,1] to [0, 0.999999] with concentration near 1
+    const v = 1 - Math.pow(10, -6 * frac);
+    points.push(v);
+  }
+  return points;
+}
+
+const speedPoints = generateSpeedPoints(200);
+
+// ========== CHART 1: Time Dilation ==========
+function timeDilation(v) {
+  if (v >= 1) return 0;
+  return Math.sqrt(1 - v*v);
+}
+
+// Custom log-like axis for speed (0 to 1): transform v → -log10(1-v)
+// So v=0 maps to 0, v=0.9 maps to 1, v=0.99 maps to 2, v=0.999 maps to 3, etc.
+function speedToAxis(v) {
+  if (v >= 1) return 6;
+  if (v <= 0) return 0;
+  return -Math.log10(1 - v);
+}
+
+function axisToSpeed(a) {
+  return 1 - Math.pow(10, -a);
+}
+
+// For y-axis dilation: we want 1 at top, 0 at bottom, log-spaced near 0
+// Transform d → -log10(d) so d=1 → 0, d=0.1 → 1, d=0.01 → 2
+// We'll plot on a log scale directly
+
+const timeData = speedPoints.map(v => ({
+  x: speedToAxis(v),
+  y: timeDilation(v),
+  rawSpeed: v
+}));
+
+const timeChart = new Chart(document.getElementById('timeChart'), {
+  type: 'line',
+  data: {
+    datasets: [{
+      label: 'Time dilation factor (t\'/t)',
+      data: timeData,
+      borderColor: '#7dd3fc',
+      backgroundColor: 'rgba(125, 211, 252, 0.1)',
+      borderWidth: 2,
+      pointRadius: 0,
+      pointHoverRadius: 5,
+      tension: 0.1,
+      fill: true
+    }]
+  },
+  options: {
+    responsive: true,
+    maintainAspectRatio: false,
+    events: [], // disable default hover/click; we drive tooltip manually via right-click
+    interaction: { mode: 'index', intersect: false },
+    hover: { mode: 'index', intersect: false },
+    scales: {
+      x: {
+        type: 'linear',
+        min: 0,
+        max: 6,
+        title: { display: true, text: 'Speed (fraction of c) — log scale near c', color: '#aaa' },
+        ticks: {
+          color: '#aaa',
+          callback: function(val) {
+            const labels = ['0', '0.9c', '0.99c', '0.999c', '0.9999c', '0.99999c', '0.999999c'];
+            const idx = Math.round(val);
+            return labels[idx] || '';
+          },
+          stepSize: 1
+        },
+        grid: { color: '#2a3441' }
+      },
+      y: {
+        type: 'logarithmic',
+        min: 0.0001,
+        max: 1,
+        title: { display: true, text: 'Time dilation factor (1 = Earth time, 0 = frozen)', color: '#aaa' },
+        ticks: {
+          color: '#aaa',
+          callback: function(val) { return val.toString(); }
+        },
+        grid: { color: '#2a3441' }
+      }
+    },
+    plugins: {
+      legend: { labels: { color: '#e6e6e6' } },
+      tooltip: {
+        enabled: false,
+        mode: 'index',
+        intersect: false,
+        callbacks: {
+          title: function(items) {
+            const v = items[0].raw.rawSpeed;
+            return `v = ${v.toFixed(6)}c`;
+          },
+          label: function(item) {
+            return `Moving clock shows: ${item.raw.y.toFixed(6)} s per Earth second`;
+          }
+        }
+      }
+    }
+  }
+});
+
+// Time dilation slider readout
+const timeSlider = document.getElementById('timeSlider');
+const timeSpeedVal = document.getElementById('timeSpeedVal');
+const timeReadout = document.getElementById('timeReadout');
+
+function updateTimeReadout() {
+  const v = parseFloat(timeSlider.value);
+  const d = timeDilation(v);
+  const gamma = 1/d;
+  timeSpeedVal.textContent = v.toFixed(6) + 'c';
+  timeReadout.innerHTML = `At <span class="value">${v.toFixed(6)}c</span>: γ = <span class="value">${gamma.toFixed(4)}</span><br>` +
+    `For every 1 year on Earth, <span class="value">${d.toFixed(6)}</span> years pass on the ship.<br>` +
+    `Equivalently: 1 year on the ship = <span class="value">${gamma.toFixed(4)}</span> years on Earth.`;
+}
+timeSlider.addEventListener('input', updateTimeReadout);
+updateTimeReadout();
+
+// ========== CHART 2: Length Contraction ==========
+// Same math as time dilation — length contracts by same factor
+function lengthContraction(v) {
+  if (v >= 1) return 0;
+  return Math.sqrt(1 - v*v);
+}
+
+const spaceData = speedPoints.map(v => ({
+  x: speedToAxis(v),
+  y: lengthContraction(v),
+  rawSpeed: v
+}));
+
+const spaceChart = new Chart(document.getElementById('spaceChart'), {
+  type: 'line',
+  data: {
+    datasets: [{
+      label: 'Contracted length (light-years) for 1 ly rest-frame ruler',
+      data: spaceData,
+      borderColor: '#fbbf24',
+      backgroundColor: 'rgba(251, 191, 36, 0.1)',
+      borderWidth: 2,
+      pointRadius: 0,
+      pointHoverRadius: 5,
+      tension: 0.1,
+      fill: true
+    }]
+  },
+  options: {
+    responsive: true,
+    maintainAspectRatio: false,
+    events: [],
+    interaction: { mode: 'index', intersect: false },
+    hover: { mode: 'index', intersect: false },
+    scales: {
+      x: {
+        type: 'linear',
+        min: 0,
+        max: 6,
+        title: { display: true, text: 'Speed (fraction of c) — log scale near c', color: '#aaa' },
+        ticks: {
+          color: '#aaa',
+          callback: function(val) {
+            const labels = ['0', '0.9c', '0.99c', '0.999c', '0.9999c', '0.99999c', '0.999999c'];
+            const idx = Math.round(val);
+            return labels[idx] || '';
+          },
+          stepSize: 1
+        },
+        grid: { color: '#2a3441' }
+      },
+      y: {
+        type: 'logarithmic',
+        min: 0.0001,
+        max: 1,
+        title: { display: true, text: 'Length (light-years, 1 = rest length, 0 = squished to nothing)', color: '#aaa' },
+        ticks: { color: '#aaa' },
+        grid: { color: '#2a3441' }
+      }
+    },
+    plugins: {
+      legend: { labels: { color: '#e6e6e6' } },
+      tooltip: {
+        enabled: false,
+        mode: 'index',
+        intersect: false,
+        callbacks: {
+          title: function(items) {
+            const v = items[0].raw.rawSpeed;
+            return `v = ${v.toFixed(6)}c`;
+          },
+          label: function(item) {
+            return `1 light-year appears as: ${item.raw.y.toFixed(6)} light-years`;
+          }
+        }
+      }
+    }
+  }
+});
+
+const spaceSlider = document.getElementById('spaceSlider');
+const spaceSpeedVal = document.getElementById('spaceSpeedVal');
+const spaceReadout = document.getElementById('spaceReadout');
+
+function updateSpaceReadout() {
+  const v = parseFloat(spaceSlider.value);
+  const L = lengthContraction(v);
+  spaceSpeedVal.textContent = v.toFixed(6) + 'c';
+  spaceReadout.innerHTML = `At <span class="value">${v.toFixed(6)}c</span>:<br>` +
+    `A 1 light-year ruler (at rest) appears as <span class="value">${L.toFixed(6)}</span> light-years to you.<br>` +
+    `A journey that's 1 ly in Earth's frame becomes <span class="value">${L.toFixed(6)}</span> ly in your frame — which is why relativistic travelers "reach" distant stars faster than light would seem to allow (from their own perspective).`;
+}
+spaceSlider.addEventListener('input', updateSpaceReadout);
+updateSpaceReadout();
+
+// ========== CHART 3: Rocket Equation ==========
+// Relativistic rocket equation:
+// mass ratio = ((1+β)/(1-β))^(c/(2*v_exhaust))
+// where β = Δv / c
+// Fuel mass = payload * (mass_ratio - 1)
+//
+// For low exhaust velocities, use non-relativistic: m_ratio = exp(Δv / v_exhaust)
+
+const payload = 1000; // kg
+
+const fuels = [
+  { name: 'Chemical (4.4 km/s)', v_ex: 4400, color: '#ef4444' },
+  { name: 'Ion drive (50 km/s)', v_ex: 50000, color: '#f59e0b' },
+  { name: 'Nuclear thermal (10 km/s)', v_ex: 10000, color: '#84cc16' },
+  { name: 'Fusion (10,000 km/s)', v_ex: 10000000, color: '#06b6d4' },
+  { name: 'Astrophage (fictional, 0.1c)', v_ex: 0.1 * c, color: '#10b981' },
+  { name: 'Antimatter (c)', v_ex: c, color: '#a855f7' }
+];
+
+// Delta-v points: log-distributed from 0.00001c to 0.999c
+// so zooming into small Δv ranges still has enough resolution
+function generateDvPoints() {
+  const pts = [];
+  // Log-spaced points from 1e-5 to 0.999
+  for (let i = 0; i <= 400; i++) {
+    const frac = i / 400;
+    // Interpolate in log space
+    const logBeta = -5 + frac * (Math.log10(0.999) - (-5));
+    pts.push(Math.pow(10, logBeta));
+  }
+  return pts;
+}
+
+const dvBetas = generateDvPoints();
+
+function fuelMass(beta, v_ex, payload) {
+  // Use relativistic formula
+  // mass ratio = ((1+β)/(1-β))^(c/(2*v_ex))
+  const ratio = Math.pow((1 + beta)/(1 - beta), c / (2 * v_ex));
+  return payload * (ratio - 1);
+}
+
+const rocketDatasets = fuels.map(f => ({
+  label: f.name,
+  data: dvBetas.map(beta => ({
+    x: beta,
+    y: Math.max(fuelMass(beta, f.v_ex, payload), 1e-3)
+  })),
+  borderColor: f.color,
+  backgroundColor: f.color + '20',
+  borderWidth: 2,
+  pointRadius: 0,
+  pointHoverRadius: 4,
+  tension: 0.1,
+  fill: false
+}));
+
+const rocketChart = new Chart(document.getElementById('rocketChart'), {
+  type: 'line',
+  data: { datasets: rocketDatasets },
+  options: {
+    responsive: true,
+    maintainAspectRatio: false,
+    events: ['click'],
+    interaction: { mode: 'index', intersect: false },
+    hover: { mode: 'index', intersect: false },
+    onClick: (event, elements, chart) => {
+      // Ignore clicks that are part of a double-click
+      if (window.__suppressRocketClick) return;
+      if (elements.length === 0) return;
+      // Find which dataset's line was clicked (the one closest to cursor in y)
+      const canvasY = event.y;
+      let closest = null;
+      let closestDist = Infinity;
+      elements.forEach(el => {
+        const dist = Math.abs(el.element.y - canvasY);
+        if (dist < closestDist) {
+          closestDist = dist;
+          closest = el;
+        }
+      });
+      if (!closest) return;
+      const datasetIdx = closest.datasetIndex;
+      const fuel = fuels[datasetIdx];
+
+      // Find the Δv at which fuel mass reaches a chosen threshold.
+      // Binary search for β where fuelMass ≈ threshold
+      function findBetaForMass(target, v_ex) {
+        let lo = 1e-8, hi = 0.9999;
+        for (let i = 0; i < 60; i++) {
+          const mid = (lo + hi) / 2;
+          if (fuelMass(mid, v_ex, payload) < target) lo = mid;
+          else hi = mid;
+        }
+        return hi;
+      }
+
+      // X-axis max: where fuel mass hits a "practically infinite" threshold
+      // We pick 1e30 kg as the "top" of the visible range
+      const topMass = 1e30;
+      const betaTop = findBetaForMass(topMass, fuel.v_ex);
+      // Nice rounding of x-axis max
+      let xMax;
+      if (betaTop > 0.5) xMax = 1.0;
+      else if (betaTop > 0.2) xMax = 0.5;
+      else if (betaTop > 0.1) xMax = 0.2;
+      else if (betaTop > 0.05) xMax = 0.1;
+      else if (betaTop > 0.02) xMax = 0.05;
+      else if (betaTop > 0.01) xMax = 0.02;
+      else if (betaTop > 0.005) xMax = 0.01;
+      else if (betaTop > 0.002) xMax = 0.005;
+      else if (betaTop > 0.001) xMax = 0.002;
+      else if (betaTop > 0.0005) xMax = 0.001;
+      else if (betaTop > 0.0002) xMax = 0.0005;
+      else xMax = 0.0002;
+
+      // Y-axis: bottom-left at ~0 (use 0.1 kg as floor), top at fuel mass at xMax
+      // But if xMax is 1.0 (approaches c), mass diverges — use mass at 0.99c instead
+      const yHighEvalAt = Math.min(xMax, 0.99);
+      const yHigh = Math.max(fuelMass(yHighEvalAt, fuel.v_ex, payload), 1e3);
+      const logHigh = Math.log10(yHigh) + 0.5;
+
+      chart.options.scales.x.max = xMax;
+      chart.options.scales.y.min = 0.1;
+      chart.options.scales.y.max = Math.pow(10, logHigh);
+      chart.update();
+
+      document.getElementById('zoomInfo').innerHTML =
+        `Axes zoomed to show <span class="value">${fuel.name}</span> diagonally ` +
+        `(Δv up to ${xMax}c, fuel up to ${yHigh.toExponential(1)} kg). ` +
+        `<a href="#" id="resetZoom" style="color:#7dd3fc;">Reset zoom</a>`;
+      document.getElementById('resetZoom').addEventListener('click', (e) => {
+        e.preventDefault();
+        chart.options.scales.x.max = 1;
+        chart.options.scales.y.min = 0.1;
+        chart.options.scales.y.max = undefined;
+        chart.update();
+        document.getElementById('zoomInfo').innerHTML = 'Click any line to zoom the axes to that fuel.';
+      });
+    },
+    scales: {
+      x: {
+        type: 'linear',
+        min: 0,
+        max: 1,
+        title: { display: true, text: 'Δv (fraction of c)', color: '#aaa' },
+        ticks: { color: '#aaa' },
+        grid: { color: '#2a3441' }
+      },
+      y: {
+        type: 'logarithmic',
+        min: 0.1,
+        title: { display: true, text: 'Fuel mass (kg) for 1000 kg payload — log scale', color: '#aaa' },
+        ticks: {
+          color: '#aaa',
+          callback: function(val) {
+            if (val >= 1e60) return '10^' + Math.log10(val).toFixed(0);
+            if (val >= 1e12) return val.toExponential(0);
+            if (val >= 1e6) return (val/1e6).toFixed(0) + 'M';
+            if (val >= 1e3) return (val/1e3).toFixed(0) + 'k';
+            return val.toFixed(0);
+          }
+        },
+        grid: { color: '#2a3441' }
+      }
+    },
+    plugins: {
+      legend: { labels: { color: '#e6e6e6' } },
+      tooltip: {
+        enabled: false,
+        mode: 'index',
+        intersect: false,
+        callbacks: {
+          title: function(items) { return `Δv = ${items[0].raw.x.toFixed(4)}c`; },
+          label: function(item) {
+            const kg = item.raw.y;
+            let display;
+            if (kg > 1e30) display = kg.toExponential(2) + ' kg  (more than the mass of the observable universe!)';
+            else if (kg > 1.989e30) display = kg.toExponential(2) + ' kg  (~' + (kg/1.989e30).toExponential(1) + ' suns)';
+            else if (kg > 1e20) display = kg.toExponential(2) + ' kg';
+            else if (kg > 1e6) display = (kg/1e6).toFixed(1) + ' million kg';
+            else display = kg.toFixed(1) + ' kg';
+            return `${item.dataset.label}: ${display}`;
+          }
+        }
+      }
+    }
+  }
+});
+
+// Fuel toggle checkboxes
+document.querySelectorAll('.fuelToggle').forEach(cb => {
+  cb.addEventListener('change', function() {
+    const idx = parseInt(this.dataset.idx);
+    rocketChart.setDatasetVisibility(idx, this.checked);
+    rocketChart.update();
+  });
+});
+
+// ========== CHART 4: Relativistic Kinetic Energy ==========
+// KE = (γ - 1) * m * c^2
+// Newtonian: KE = 0.5 * m * v^2
+const mass = 1; // kg
+
+function gamma(beta) {
+  if (beta >= 1) return Infinity;
+  return 1 / Math.sqrt(1 - beta*beta);
+}
+
+function relKE(beta) {
+  const g = gamma(beta);
+  return (g - 1) * mass * c * c;
+}
+
+function newtKE(beta) {
+  const v = beta * c;
+  return 0.5 * mass * v * v;
+}
+
+const kePoints = [];
+for (let i = 1; i <= 300; i++) {
+  const frac = i / 300;
+  const beta = 0.001 + (0.99999 - 0.001) * frac;
+  kePoints.push(beta);
+}
+
+const keChart = new Chart(document.getElementById('keChart'), {
+  type: 'line',
+  data: {
+    datasets: [
+      {
+        label: 'Relativistic KE = (γ − 1)mc²',
+        data: kePoints.map(beta => ({ x: beta, y: relKE(beta) })),
+        borderColor: '#ec4899',
+        backgroundColor: 'rgba(236, 72, 153, 0.1)',
+        borderWidth: 2,
+        pointRadius: 0,
+        pointHoverRadius: 5,
+        tension: 0.1,
+        fill: false
+      },
+      {
+        label: 'Newtonian KE = ½mv² (for comparison)',
+        data: kePoints.map(beta => ({ x: beta, y: newtKE(beta) })),
+        borderColor: '#64748b',
+        backgroundColor: 'rgba(100, 116, 139, 0.1)',
+        borderWidth: 2,
+        borderDash: [6, 4],
+        pointRadius: 0,
+        pointHoverRadius: 5,
+        tension: 0.1,
+        fill: false
+      }
+    ]
+  },
+  options: {
+    responsive: true,
+    maintainAspectRatio: false,
+    events: [],
+    interaction: { mode: 'index', intersect: false },
+    hover: { mode: 'index', intersect: false },
+    scales: {
+      x: {
+        type: 'linear',
+        min: 0,
+        max: 1,
+        title: { display: true, text: 'Velocity (fraction of c)', color: '#aaa' },
+        ticks: { color: '#aaa' },
+        grid: { color: '#2a3441' }
+      },
+      y: {
+        type: 'logarithmic',
+        title: { display: true, text: 'Kinetic energy (Joules) for 1 kg object — log scale', color: '#aaa' },
+        ticks: {
+          color: '#aaa',
+          callback: function(val) {
+            const exp = Math.log10(val);
+            if (Math.abs(exp - Math.round(exp)) < 0.01) return '10^' + Math.round(exp);
+            return '';
+          }
+        },
+        grid: { color: '#2a3441' }
+      }
+    },
+    plugins: {
+      legend: { labels: { color: '#e6e6e6' } },
+      tooltip: {
+        enabled: false,
+        mode: 'index',
+        intersect: false,
+        callbacks: {
+          title: function(items) { return `v = ${items[0].raw.x.toFixed(6)}c`; },
+          label: function(item) {
+            return `${item.dataset.label}: ${item.raw.y.toExponential(3)} J`;
+          }
+        }
+      }
+    }
+  }
+});
+
+const keSlider = document.getElementById('keSlider');
+const keSpeedVal = document.getElementById('keSpeedVal');
+const keReadout = document.getElementById('keReadout');
+
+function updateKeReadout() {
+  const v = parseFloat(keSlider.value);
+  const kRel = relKE(v);
+  const kNewt = newtKE(v);
+  const ratio = kRel / kNewt;
+  // Hiroshima bomb ≈ 6.3e13 J; Sun output per second ≈ 3.8e26 J
+  let comparison = '';
+  if (kRel > 1e30) comparison = ` (~${(kRel/3.8e26).toExponential(1)} seconds of the Sun's output)`;
+  else if (kRel > 1e20) comparison = ` (~${(kRel/6.3e13).toExponential(1)} Hiroshima bombs)`;
+  else if (kRel > 1e14) comparison = ` (~${(kRel/6.3e13).toFixed(1)} Hiroshima bombs)`;
+
+  keSpeedVal.textContent = v.toFixed(6) + 'c';
+  keReadout.innerHTML = `At <span class="value">${v.toFixed(6)}c</span>:<br>` +
+    `Relativistic KE: <span class="value">${kRel.toExponential(3)} J</span>${comparison}<br>` +
+    `Newtonian KE would predict: ${kNewt.toExponential(3)} J<br>` +
+    `Relativistic is <span class="value">${ratio.toFixed(2)}×</span> larger than Newtonian prediction — this is the "energy wall."`;
+}
+keSlider.addEventListener('input', updateKeReadout);
+updateKeReadout();
+
+// ========== Attach right-click-hold tooltip and double-click zoom to all charts ==========
+window.rocketChartRef = rocketChart;
+
+// Custom tooltip configurations for each chart
+timeChart.$customTooltipConfig = {
+  titleFormat: (axisX) => {
+    // axisX is in the transformed speed space (-log10(1-v))
+    const v = axisToSpeed(axisX);
+    return `v = ${v.toFixed(6)}c`;
+  },
+  labelFormat: (dataset, pt) => {
+    return `Time factor: ${pt.y.toFixed(6)} (1s Earth → ${pt.y.toFixed(6)}s ship)`;
+  }
+};
+
+spaceChart.$customTooltipConfig = {
+  titleFormat: (axisX) => {
+    const v = axisToSpeed(axisX);
+    return `v = ${v.toFixed(6)}c`;
+  },
+  labelFormat: (dataset, pt) => {
+    return `1 light-year appears as ${pt.y.toFixed(6)} ly`;
+  }
+};
+
+rocketChart.$customTooltipConfig = {
+  titleFormat: (x) => `Δv = ${x.toFixed(4)}c`,
+  labelFormat: (dataset, pt) => {
+    const kg = pt.y;
+    let display;
+    if (kg > 1e30) display = kg.toExponential(2) + ' kg  (> mass of observable universe!)';
+    else if (kg > 1.989e30) display = kg.toExponential(2) + ' kg  (~' + (kg/1.989e30).toExponential(1) + ' suns)';
+    else if (kg > 1e20) display = kg.toExponential(2) + ' kg';
+    else if (kg > 1e6) display = (kg/1e6).toFixed(1) + ' million kg';
+    else display = kg.toFixed(1) + ' kg';
+    return `${dataset.label}: ${display}`;
+  }
+};
+
+keChart.$customTooltipConfig = {
+  titleFormat: (x) => `v = ${x.toFixed(6)}c`,
+  labelFormat: (dataset, pt) => {
+    return `${dataset.label}: ${pt.y.toExponential(3)} J`;
+  }
+};
+
+[timeChart, spaceChart, rocketChart, keChart].forEach(chart => {
+  window.allCharts.push(chart);
+  attachChartInteractions(chart);
+});
+</script>
+
+</body>
+</html>
