@@ -2,6 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
+<meta name="description" content="Interactive graphs of time dilation, length contraction, the relativistic rocket equation and relativistic kinetic energy.">
 <title>Relativity & Rocket Physics — Interactive Graphs</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js"></script>
 <script>
@@ -768,7 +769,7 @@ const rocketChart = new Chart(document.getElementById('rocketChart'), {
           label: function(item) {
             const kg = item.raw.y;
             let display;
-            if (kg > 1e30) display = kg.toExponential(2) + ' kg  (more than the mass of the observable universe!)';
+            if (kg > 1.5e53) display = kg.toExponential(2) + ' kg  (more than the mass of the observable universe!)';
             else if (kg > 1.989e30) display = kg.toExponential(2) + ' kg  (~' + (kg/1.989e30).toExponential(1) + ' suns)';
             else if (kg > 1e20) display = kg.toExponential(2) + ' kg';
             else if (kg > 1e6) display = (kg/1e6).toFixed(1) + ' million kg';
@@ -802,7 +803,9 @@ function gamma(beta) {
 
 function relKE(beta) {
   const g = gamma(beta);
-  return (g - 1) * mass * c * c;
+  if (!isFinite(g)) return Infinity;
+  // γ − 1 = β²γ²/(γ + 1): same value, but no cancellation at low speed
+  return (beta * beta * g * g / (g + 1)) * mass * c * c;
 }
 
 function newtKE(beta) {
@@ -900,7 +903,7 @@ function updateKeReadout() {
   const v = parseFloat(keSlider.value);
   const kRel = relKE(v);
   const kNewt = newtKE(v);
-  const ratio = kRel / kNewt;
+  const ratio = kNewt > 0 ? kRel / kNewt : 1; // limit as v → 0 is 1
   // Hiroshima bomb ≈ 6.3e13 J; Sun output per second ≈ 3.8e26 J
   let comparison = '';
   if (kRel > 1e30) comparison = ` (~${(kRel/3.8e26).toExponential(1)} seconds of the Sun's output)`;
@@ -946,7 +949,8 @@ rocketChart.$customTooltipConfig = {
   labelFormat: (dataset, pt) => {
     const kg = pt.y;
     let display;
-    if (kg > 1e30) display = kg.toExponential(2) + ' kg  (> mass of observable universe!)';
+    // Observable universe (ordinary matter) ≈ 1.5e53 kg; Sun ≈ 1.989e30 kg
+    if (kg > 1.5e53) display = kg.toExponential(2) + ' kg  (> mass of observable universe!)';
     else if (kg > 1.989e30) display = kg.toExponential(2) + ' kg  (~' + (kg/1.989e30).toExponential(1) + ' suns)';
     else if (kg > 1e20) display = kg.toExponential(2) + ' kg';
     else if (kg > 1e6) display = (kg/1e6).toFixed(1) + ' million kg';
