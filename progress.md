@@ -9,6 +9,7 @@ Nothing is in progress. The app is finished and live at https://timothyhadfield.
 ## Status
 | Area | State |
 |---|---|
+| Site icon (tab + iPhone home screen) | Added 2026-10-17: blue curve shooting up to a dashed amber "c" line on graph axes; `icon.svg` + `apple-touch-icon.png` |
 | Four graphs | Live and working |
 | Physics | Checked against textbook formulas 2026-10-16 |
 | Tests | None (single HTML file). Verify with phone-view `--eval` |
